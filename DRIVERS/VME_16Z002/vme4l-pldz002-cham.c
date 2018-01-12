@@ -641,6 +641,7 @@ static int DmaSetup(
 	int alignVme=4, sg, rv=0, endBd;
 	uint32_t bdAm;
 	char *bdVaddr;
+	int novmeinc;
 
 	/* DMA controller supports only BLT spaces */
 	switch( spc ){
@@ -672,6 +673,7 @@ static int DmaSetup(
 	bdVaddr = MEN_PLDZ002_DMABD_OFFS;
 	VME4LDBG("DmaSetup: bdVaddr=%p\n", bdVaddr );
 
+	novmeinc = flags & VME4L_RW_NOVMEINC;
 	endBd = (sgNelems < PLDZ002_DMA_MAX_BDS) ? sgNelems : PLDZ002_DMA_MAX_BDS;
 
 	/* setup scatter list */
@@ -698,7 +700,8 @@ static int DmaSetup(
 							PLDZ002_DMABD_SRC( PLDZ002_DMABD_DIR_PCI ) |
 							PLDZ002_DMABD_DST( PLDZ002_DMABD_DIR_VME ) |
 							bdAm | ((sg == endBd-1) ? PLDZ002_DMABD_END : 0 ) |
-							(( flags & VME4L_RW_USE_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) );
+							(( flags & VME4L_RW_USE_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) |
+							(novmeinc ? PLDZ002_DMABD_NOINC_DST : 0));
 		}
 		else {
 			/* read from VME */
@@ -709,9 +712,12 @@ static int DmaSetup(
 								PLDZ002_DMABD_SRC( PLDZ002_DMABD_DIR_VME ) |
 								PLDZ002_DMABD_DST( PLDZ002_DMABD_DIR_PCI ) |
 								bdAm | ((sg == endBd-1) ? PLDZ002_DMABD_END : 0 ) |
-								(( flags & VME4L_RW_USE_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) );
+								(( flags & VME4L_RW_USE_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) |
+								(novmeinc ? PLDZ002_DMABD_NOINC_SRC : 0));
 		}
-		*vmeAddr += sgList->dmaLength;
+
+		if (!novmeinc)
+			*vmeAddr += sgList->dmaLength;
 	}
 
 	if (debug) {
