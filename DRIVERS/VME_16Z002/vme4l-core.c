@@ -3077,6 +3077,31 @@ static int vme4l_supported_bitstreams_proc_show(struct seq_file *m, void *data)
 	return 0;
 }
 
+static int vme4l_fpga_bitstream_version_proc_show(struct seq_file *m, void *data)
+{
+	uint16_t table_rev;
+	uint16_t table_minRev;
+
+	if (G_bDrv && G_bDrv->getBitstreamVersion){
+		G_bDrv->getBitstreamVersion(&table_rev, &table_minRev);
+		seq_printf(m, "%d.%d\n", table_rev, table_minRev);
+	}
+
+	return 0;
+}
+
+static int vme4l_fpga_bitstream_version_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, vme4l_fpga_bitstream_version_proc_show, NULL);
+}
+
+static const struct file_operations vme4l_fpga_bitstream_version_proc_ops = {
+	.open		= vme4l_fpga_bitstream_version_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static int vme4l_supported_bitstreams_proc_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, vme4l_supported_bitstreams_proc_show, NULL);
@@ -3162,6 +3187,10 @@ static void vme_bridge_procfs_register(void)
 	entry = proc_create("supported_bitstreams", S_IFREG | S_IRUGO, vme4l_root, &vme4l_supported_bitstreams_proc_ops);
 	if (!entry)
 		printk(KERN_WARNING "vme4l: Failed to create proc supported_bitstreams node\n");
+
+	entry = proc_create("fpga_bitstream_version", S_IFREG | S_IRUGO, vme4l_root, &vme4l_fpga_bitstream_version_proc_ops);
+	if (!entry)
+		printk(KERN_WARNING "vme4l: Failed to create proc fpga_bitstream_version node\n");
 }
 
 static void vme_bridge_procfs_unregister(void)

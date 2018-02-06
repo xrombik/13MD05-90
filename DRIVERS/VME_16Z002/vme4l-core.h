@@ -178,12 +178,18 @@ typedef struct VME4L_BRIDGE_DRV {
 	void (*revisionInfo)( VME4L_BRIDGE_HANDLE *h, char *buf );
 
 	/***********************************************************************/
-	/** Get supported 
+	/** Get a list of supported bitstreams using the seq_file interface
 	 *
-	 * bridge driver shall sprintf HW and bridge driver revision information
-	 * into \a buf (100 bytes max)
+	 * bridge driver shall fill a new-line separated list of supported
+	 * bitstreams using the seq_file interface (for proc entry)
 	 */
 	void (*getSupportedBitstreams)(struct seq_file *m);
+
+	/***********************************************************************/
+	/** Get a FPGA bitstream version
+	 *
+	 */
+	void (*getBitstreamVersion)(uint16_t *table_rev, uint16_t *table_minRev);
 
 	/***********************************************************************/
     /** Request VME master address window

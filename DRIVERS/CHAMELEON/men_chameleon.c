@@ -918,6 +918,8 @@ static int __devinit pci_init_one (
         v2unit->unitFpga.offset    	= info.offset;
         v2unit->unitFpga.size      	= info.size;
         v2unit->unitFpga.addr  		= (void *)(U_INT32_OR_64)(pci_resource_start(pdev,info.bar) + info.offset);
+        v2unit->table_rev 		= table.revision;
+        v2unit->table_minRev 		= table.minRevision;
 
         /* if specified use IRQ given by PCI config space */
         if( usePciIrq ) {

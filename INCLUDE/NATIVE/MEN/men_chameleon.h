@@ -129,6 +129,8 @@ typedef struct {
     struct pci_dev *pdev;                /**< the pci device handling this unit 
                                              (NULL for early access routines) */
     void *driver_data;                   /**< data private to driver  */
+    uint16_t table_rev;                  /**< Chameleon table revision */
+    uint16_t table_minRev;               /**< Chameleon table minor revision */
     struct CHAMELEONV2_DRIVER_T *driver; /**< attached driver (NULL if none) */
 } CHAMELEONV2_UNIT_T;
 

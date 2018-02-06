@@ -328,6 +328,14 @@ void GetSupportedBitstreams(struct seq_file *m)
 	}
 }
 
+void GetBitstreamVersion(uint16_t *table_rev, uint16_t *table_minRev)
+{
+	if (table_rev)
+		*table_rev = G_bHandle.chu->table_rev;
+	if (table_minRev)
+		*table_minRev = G_bHandle.chu->table_minRev;
+}
+
 /***********************************************************************/
 /** Get system IRQ no.
  */
@@ -1699,6 +1707,7 @@ int LocMonRegWriteFs2(
 static VME4L_BRIDGE_DRV G_bridgeDrv = {
 	.revisionInfo		= RevisionInfo,
 	.getSupportedBitstreams = GetSupportedBitstreams,
+	.getBitstreamVersion    = GetBitstreamVersion,
 	.requestAddrWindow 	= RequestAddrWindow,
 	.releaseAddrWindow 	= ReleaseAddrWindow,
 	.irqLevelCtrl		= IrqLevelCtrl,
