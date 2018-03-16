@@ -236,8 +236,14 @@ typedef enum {
 	CHAM_SPC_END,
 } VME_SPACE_CHAM;
 
+struct vme4l_bridge_handle;
+
+typedef struct vme4l_bridge_handle VME4L_BRIDGE_HANDLE;
+#define COMPILE_VME_BRIDGE_DRIVER
+#include "vme4l-core.h"
+
 /** bridge drivers private data */
-typedef struct {
+struct vme4l_bridge_handle {
 	CHAMELEONV2_UNIT_T * chu;		/**< chameleon unit for vme control registers  */
 	unsigned long spaces[CHAM_SPC_END]; /**< chameleon units of the separate spaces*/
 	VME4L_RESRC regs;			/**< bridge regs [+ PLD internal RAM if any] */
@@ -261,18 +267,17 @@ typedef struct {
 	uint32_t berrAddr;			/**< bus error causing address */
 	uint32_t berrAcc;			/**< bus error causing properties */
 	uint32_t hasExtBerrInfo;
+	uint32_t dmaError;
 	spinlock_t lockState;		/**< spin lock for VME bridge registers and handle state */
 	int refCounter;		/**< number of registered clients */
-} VME4L_BRIDGE_HANDLE;
+	VME4L_IRQ_STAT irqs;
+};
 
 
 typedef struct {
 	u_int16 revision;
 	u_int16 min_revision;
 } VME4L_BITSTREAM_VERSION;
-
-#define COMPILE_VME_BRIDGE_DRIVER
-#include "vme4l-core.h"
 
 /*--------------------------------------+
 |   GLOBALS                             |
@@ -294,8 +299,9 @@ static CHAMELEONV2_DRIVER_T G_driver = {
 
 /* List of supported bitstreams */
 static VME4L_BITSTREAM_VERSION supported_bitstream_ver[] = {
-	{ 3, 9},
-	{ 0, 0}
+	{ 3, 11},
+	{ 3, 10},
+	{ 0,  0}
 };
 
 static int debug = DEBUG_DEFAULT;  /**< enable debug printouts */
@@ -324,6 +330,22 @@ void GetSupportedBitstreams(struct seq_file *m)
 		seq_printf(m, "%d.%d\n", entry->revision, entry->min_revision);
 		entry++;
 	}
+}
+
+int GetIrqStats(VME4L_BRIDGE_HANDLE *h, VME4L_IRQ_STAT *irqs, size_t stats_size)
+{
+	unsigned seq1;
+	unsigned seq2;
+	
+	seq1 = h->irqs.sequence;
+	memcpy(irqs, &h->irqs, stats_size);
+	seq2 = h->irqs.sequence;
+
+	if ((seq1 != seq2) || (h->irqs.sequence & 1)) {
+		/* Inconsistent data */
+		return -1;
+	}
+	return 0;
 }
 
 /***********************************************************************/
@@ -368,9 +390,10 @@ static int RequestAddrWindow(
 	size_t size=0;
 	vmeaddr_t vmeAddr=0;
 	int rv = 0;
+	unsigned long ps;
 
 	*bDrvDataP = NULL;			/* don't need it for now */
-	PLDZ002_LOCK_STATE();
+	PLDZ002_LOCK_STATE_IRQ(ps);
 
 	switch( spc ){
 	case VME4L_SPC_A16_D16:
@@ -442,7 +465,7 @@ static int RequestAddrWindow(
 		*sizeP	   = size;
 	}
 
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 
 	return rv;
 }
@@ -486,7 +509,9 @@ static int ReleaseAddrWindow(
 	int flags,
 	void *bDrvData)
 {
-	PLDZ002_LOCK_STATE();
+	unsigned long ps;
+
+	PLDZ002_LOCK_STATE_IRQ(ps);
 
 	switch( spc ){
 	case VME4L_SPC_A32_D32:
@@ -496,7 +521,7 @@ static int ReleaseAddrWindow(
 	default:
 		break;
 	}
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 
 	return 0;
 }
@@ -509,10 +534,11 @@ int IrqLevelCtrl(
 	int level,
 	int set )
 {
-	unsigned long ps;
+	/* unsigned long ps; */
 	int rv = -EINVAL;
 
-	PLDZ002_LOCK_STATE_IRQ(ps);
+/*	PLDZ002_LOCK_STATE_IRQ(ps); this spinlock is already taken when this
+	  function is called from PldZ002Irq->vme4l_irq->vme4l_irqlevel_disable */
 
 	/* interrupts in IMASK reg */
 	if( (level >= VME4L_IRQLEV_1 && level <= VME4L_IRQLEV_7) ||
@@ -560,7 +586,7 @@ int IrqLevelCtrl(
 		}
 	}
 
-	PLDZ002_UNLOCK_STATE_IRQ(ps);
+/* 	PLDZ002_UNLOCK_STATE_IRQ(ps); */
 
 	return rv;
 }
@@ -645,34 +671,6 @@ static inline uint32_t DmaSwapMode( int swapMode )
 #endif
 }
 
-int GetVmeBlockSize(VME4L_SPACE spc)
-{
-	switch (spc) {
-	case VME4L_SPC_A16_D16:
-	case VME4L_SPC_A24_D16:
-		/* for D16 + DMA it is 4 not 2 */
-		return 4;
-
-	case VME4L_SPC_A16_D32:
-	case VME4L_SPC_A24_D32:
-	case VME4L_SPC_A32_D32:
-	case VME4L_SPC_CR_CSR:
-		return 4;
-
-	case VME4L_SPC_A24_D16_BLT:
-	case VME4L_SPC_A24_D32_BLT:
-	case VME4L_SPC_A32_D32_BLT:
-		return 256;
-	
-	case VME4L_SPC_A24_D64_BLT:
-	case VME4L_SPC_A32_D64_BLT:
-		/* according to standard it is up to 2k, but hdl uses 1k */
-		return 1024;
-	default:
-		return 0x1000;
-	}
-}
-
 /***********************************************************************/
 /** Write DMA scatter list to DMA controller
  *
@@ -685,34 +683,28 @@ static int DmaSetup(
 	int direction,
 	int modeFlags,
 	vmeaddr_t *vmeAddr,
-	dma_addr_t *dmaAddr,
-	int *dmaLeft,
-	int vme_block_size,
 	int flags)
 {
-	int alignVme=4, sg, rv = -1;
+	int alignVme=4, sg, rv=0, endBd = 0;
 	uint32_t bdAm;
 	char *bdVaddr;
-	int dmaLen = 0;
-	int hwdesc_i;
-	int novmeinc = 0;
-	int sgLast;
-	
+	int novmeinc;
+
 	/* DMA controller supports only BLT spaces */
 	switch( spc ){
 	case VME4L_SPC_A24_D16_BLT:
 	case VME4L_SPC_A24_D32_BLT:
 	case VME4L_SPC_A32_D32_BLT:
 		bdAm = h->addrModShadow[spc];
-		/* Ignore VME4L_RW_USE_DMA for BLT modes */
-		flags &= ~VME4L_RW_USE_DMA;
+		/* Ignore VME4L_RW_USE_SGL_DMA for BLT modes */
+		flags &= ~VME4L_RW_USE_SGL_DMA;
 		break;
 	case VME4L_SPC_A24_D64_BLT:
 	case VME4L_SPC_A32_D64_BLT:
 		bdAm = h->addrModShadow[spc];
 		alignVme = 8;
-		/* Ignore VME4L_RW_USE_DMA for BLT modes */
-		flags &= ~VME4L_RW_USE_DMA;
+		/* Ignore VME4L_RW_USE_SGL_DMA for BLT modes */
+		flags &= ~VME4L_RW_USE_SGL_DMA;
 		break;
 	case VME4L_SPC_A16_D16:
 	case VME4L_SPC_A16_D32:
@@ -722,140 +714,81 @@ static int DmaSetup(
 		bdAm = h->addrModShadow[spc];
 		break;
 	default:
-		return -EINVAL;
-	}
-
-	if (debug) {
-		int i;
-		bdVaddr = MEN_PLDZ002_DMABD_OFFS;
-		VME4LDBG("clear DmaBD:\n");
-		for(i=0; i < PLDZ002_DMA_MAX_BDS; i++ ){
-			VME_GENREG_WRITE32( bdVaddr+0x0, 0 );
-			VME_GENREG_WRITE32( bdVaddr+0x4, 0 );
-			VME_GENREG_WRITE32( bdVaddr+0x8, 0 );
-			VME_GENREG_WRITE32( bdVaddr+0xc, 0 );
-			bdVaddr+=0x10;
-		}
+		printk(KERN_ERR_PFX "%s: DmaSetup unknown spc %d\n",
+		       __func__, spc);
+		rv = -EINVAL;
+		goto CLEANUP;
 	}
 
 	bdVaddr = MEN_PLDZ002_DMABD_OFFS;
 	VME4LDBG("DmaSetup: bdVaddr=%p\n", bdVaddr );
 
 	novmeinc = flags & VME4L_RW_NOVMEINC;
+	endBd = (sgNelems < PLDZ002_DMA_MAX_BDS) ? sgNelems : PLDZ002_DMA_MAX_BDS;
 
 	/* setup scatter list */
-	VME4LDBG("setup scatter list for %s. endBd = %d:\n",
-		 direction ? "write" : "read",
-		 (sgNelems < PLDZ002_DMA_MAX_BDS) ? sgNelems : PLDZ002_DMA_MAX_BDS);
+	VME4LDBG("setup scatter list for %s. endBd = %d:\n", direction ? "write" : "read", endBd);
 
-	for( hwdesc_i = 0, sg = 0; hwdesc_i < PLDZ002_DMA_MAX_BDS; hwdesc_i++, bdVaddr+=PLDZ002_DMABD_SIZE ){
-		sgLast = 0;
-
-		if (*dmaLeft == 0) {
-			/* first chunk of sg element for novmeinc, for others
-			 regular case */
-			*dmaAddr = sgList->dmaAddress;
-			*dmaLeft = sgList->dmaLength;
-		}
-
-		dmaLen = *dmaLeft;
-		if (novmeinc && ((dmaLen) > vme_block_size)) {
-			/* limit DMA transfer to a (M)BLT block size */
-			dmaLen = vme_block_size;
-		}
-
-		*dmaLeft -= dmaLen;
-
-		if (hwdesc_i == PLDZ002_DMA_MAX_BDS - 1) {
-			/* last free hwdesc_i */
-			sgLast = 1;
-			VME4LDBG( "sglast because of max BDS\n");
-		}
-
-		if (*dmaLeft == 0 && sgNelems - 1 <= sg) {
-			/* last chunk of last sg element */
-			sgLast = 1;
-			VME4LDBG( "sglast because of *dmaLeft == 0 && sgNelems - 1 <= sg\n");
-		}
-
-		VME4LDBG("%s hwdesc_i %2d, sg %2d, dmaLen 0x%04x, *dmaLeft 0x%04x, *dmaAddr 0x%8x\n",
-			 __func__, hwdesc_i, sg, dmaLen, *dmaLeft, *dmaAddr);
+	for( sg=0; sg<endBd; sg++, sgList++, bdVaddr+=PLDZ002_DMABD_SIZE ){
 
 		/*--- check alignment/size ---*/
-		if( (*vmeAddr & (alignVme-1)) || (*dmaAddr & (alignVme-1)) ||
-			(dmaLen > 256*1024) || (dmaLen & (alignVme-1))){
-			VME4LDBG( "%s: DMA setup bad alignment/len "
+		if( (*vmeAddr & (alignVme-1)) || (sgList->dmaAddress & (alignVme-1)) ||
+			(sgList->dmaLength > 256*1024) || (sgList->dmaLength & (alignVme-1))){
+			printk(KERN_ERR_PFX "%s: DMA setup bad alignment/len "
 			       "%08llx %08llx %x\n", __func__, *vmeAddr,
-			       (uint64_t)*dmaAddr, dmaLen );
+			       (uint64_t)sgList->dmaAddress, sgList->dmaLength );
+
 			rv = -EINVAL;
 			goto CLEANUP;
 		}
 
 		if( direction ) {
 			/* write to VME */
-			VME_GENREG_WRITE32( bdVaddr+0x0, *vmeAddr);
-			VME_GENREG_WRITE32( bdVaddr+0x4, *dmaAddr);
-			VME_GENREG_WRITE32( bdVaddr+0x8, (dmaLen>>2) - 1 ); /* Block Size of DMA transfer in longwords:  (x bytes / 4) -1 */
+			VME_GENREG_WRITE32( bdVaddr+0x0, *vmeAddr );
+			VME_GENREG_WRITE32( bdVaddr+0x4, sgList->dmaAddress );
+			VME_GENREG_WRITE32( bdVaddr+0x8, (sgList->dmaLength>>2) - 1 ); /* Block Size of DMA transfer in longwords:  (x bytes / 4) -1 */
 			VME_GENREG_WRITE32( bdVaddr+0xc,
 							PLDZ002_DMABD_SRC( PLDZ002_DMABD_DIR_PCI ) |
 							PLDZ002_DMABD_DST( PLDZ002_DMABD_DIR_VME ) |
-							bdAm | (sgLast ? PLDZ002_DMABD_END : 0 ) |
-							(( flags & VME4L_RW_USE_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) );
+							bdAm | ((sg == endBd-1) ? PLDZ002_DMABD_END : 0 ) |
+							(( flags & VME4L_RW_USE_SGL_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) |
+							(novmeinc ? PLDZ002_DMABD_NOINC_DST : 0));
 		}
 		else {
 			/* read from VME */
-			VME_GENREG_WRITE32( bdVaddr+0x0, *dmaAddr);
-			VME_GENREG_WRITE32( bdVaddr+0x4, *vmeAddr);
-			VME_GENREG_WRITE32( bdVaddr+0x8, (dmaLen>>2) - 1 );
+			VME_GENREG_WRITE32( bdVaddr+0x0, sgList->dmaAddress );
+			VME_GENREG_WRITE32( bdVaddr+0x4, *vmeAddr );
+			VME_GENREG_WRITE32( bdVaddr+0x8, (sgList->dmaLength>>2) - 1 );
 			VME_GENREG_WRITE32( bdVaddr+0xc,
-							PLDZ002_DMABD_SRC( PLDZ002_DMABD_DIR_VME ) |
-							PLDZ002_DMABD_DST( PLDZ002_DMABD_DIR_PCI ) |
-							bdAm | (sgLast ? PLDZ002_DMABD_END : 0 ) |
-							(( flags & VME4L_RW_USE_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) );
+								PLDZ002_DMABD_SRC( PLDZ002_DMABD_DIR_VME ) |
+								PLDZ002_DMABD_DST( PLDZ002_DMABD_DIR_PCI ) |
+								bdAm | ((sg == endBd-1) ? PLDZ002_DMABD_END : 0 ) |
+								(( flags & VME4L_RW_USE_SGL_DMA ) ? PLDZ002_DMABD_BLK_SGL : 0) |
+								(novmeinc ? PLDZ002_DMABD_NOINC_SRC : 0));
 		}
 
-		if (!novmeinc) { /* increase VME address, the simpler case... */
-			*vmeAddr += dmaLen;			
-			sgList++;
-			sg++;
-		} else {
-			if (*dmaLeft == 0) {
-				/* take another sg element */
-				sgList++;
-				sg++;
-			}
-			*dmaAddr += dmaLen;
-		}
-
-		if (*dmaLeft == 0 && sgNelems <= sg) {
-			rv = sg;
-			hwdesc_i++;
-			break;
-		}
+		if (!novmeinc)
+			*vmeAddr += sgList->dmaLength;
 	}
-
-	/* return the number of fully handled sg elements */
-	rv = sg;
 
 	if (debug) {
 		int i;
 		bdVaddr = MEN_PLDZ002_DMABD_OFFS;
-		VME4LDBG("DmaBD setup for %s %d:\n",
-			 direction ? "write" : "read" , hwdesc_i);
-		for(i=0; i < hwdesc_i; i++ ){
-			VME4LDBG("BD%02d@%x: %08x %08x %08x %08x\n",
-				 i, bdVaddr,
-				 VME_GENREG_READ32( bdVaddr+0x0 ),
-				 VME_GENREG_READ32( bdVaddr+0x4 ),
-				 VME_GENREG_READ32( bdVaddr+0x8 ),
-				 VME_GENREG_READ32( bdVaddr+0xc ));
+		VME4LDBG("DmaBD setup for %s:\n", direction ? "write" : "read" );
+		for(i=0; i < endBd; i++ ){
+			VME4LDBG("BD%d@%x: %08x %08x %08x %08x\n",
+					 i, bdVaddr,
+					 VME_GENREG_READ32( bdVaddr+0x0 ),
+					 VME_GENREG_READ32( bdVaddr+0x4 ),
+					 VME_GENREG_READ32( bdVaddr+0x8 ),
+					 VME_GENREG_READ32( bdVaddr+0xc ));
 			bdVaddr+=0x10;
 		}
 	}
 
  CLEANUP:
 	VME4LDBG("<- DmaSetup\n");
-	return rv;
+	return rv < 0 ? rv : endBd;
 }
 
 /***********************************************************************/
@@ -954,13 +887,18 @@ static int DmaBounceSetup(
  */
 static int DmaStart( VME4L_BRIDGE_HANDLE *h )
 {
+	uint8_t dmastat;
+	int rv = 0;
+	unsigned long ps;
 
-	uint8_t dmastat = VME_REG_READ8( PLDZ002_DMASTA );
-
+	PLDZ002_LOCK_STATE_IRQ(ps);
+	
+	dmastat = VME_REG_READ8( PLDZ002_DMASTA );
 	if( dmastat  & PLDZ002_DMASTA_EN ){
 		printk(KERN_ERR_PFX "%s: DMA busy! DMASTA=%02x\n",
 		       __func__, dmastat );
-		return -EBUSY;
+		rv = -EBUSY;
+		goto CLEANUP;
 	}
 	if( dmastat  & PLDZ002_DMASTA_ERR ){
 		printk(KERN_ERR_PFX "%s: DMA error pending, DMASTA=%02x. "
@@ -969,10 +907,16 @@ static int DmaStart( VME4L_BRIDGE_HANDLE *h )
 
 	VME4LDBG("DmaStart..\n");
 
+	/* clear DMA error */
+	h->dmaError = 0;
 	VME_REG_WRITE8( PLDZ002_DMASTA, PLDZ002_DMASTA_IRQ | PLDZ002_DMASTA_ERR );
+
 	/* start DMA and enable DMA interrupt */
 	VME_REG_WRITE8( PLDZ002_DMASTA, PLDZ002_DMASTA_EN | PLDZ002_DMASTA_IEN);
-	return 0;
+
+CLEANUP:
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
+	return rv;
 }
 
 /***********************************************************************/
@@ -980,7 +924,11 @@ static int DmaStart( VME4L_BRIDGE_HANDLE *h )
  */
 static int DmaStop(	VME4L_BRIDGE_HANDLE *h )
 {
+	unsigned long ps;
+
+	PLDZ002_LOCK_STATE_IRQ(ps);
 	VME_REG_WRITE8( PLDZ002_DMASTA, PLDZ002_DMASTA_IRQ | PLDZ002_DMASTA_ERR );
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 
 	return 0;
 }
@@ -993,17 +941,31 @@ static int DmaStop(	VME4L_BRIDGE_HANDLE *h )
  */
 static int DmaStatus( VME4L_BRIDGE_HANDLE *h )
 {
-	uint8_t status = VME_REG_READ8( PLDZ002_DMASTA );
+	uint8_t status;
+	int rv = 0;
+	unsigned long ps;
 
+	PLDZ002_LOCK_STATE_IRQ(ps);
+	status = VME_REG_READ8( PLDZ002_DMASTA );
 	VME4LDBG("pldz002 DmaStatus: 0x%02x\n", status );
 
-	if( status & PLDZ002_DMASTA_EN )
-		return 1;				/* runnig */
+	if( status & PLDZ002_DMASTA_EN ) {
+		rv = 1 ; /* runnig */
+		goto CLEANUP;
+	}
 
-	if( status & PLDZ002_DMASTA_ERR )
-		return -EIO;
+	if( status & PLDZ002_DMASTA_ERR || h->dmaError) {
+		printk(KERN_ERR_PFX "%s: DMA error! DMASTA=%02x, "
+		       "h->dmaError = %d\n",
+		       __func__, status, h->dmaError);
+		rv = -EIO; /* runnig */
+		goto CLEANUP;
+	}
 
-	return 0;					/* ok */
+
+CLEANUP:
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
+	return rv; /* ok */
 }
 
 /**********************************************************************/
@@ -1014,13 +976,14 @@ static int IrqGenerate(
 	int level,
 	int vector)
 {
+	unsigned long ps;
 	int rv = _PLDZ002_INTERRUPTER_ID;
 
 	if( (level < VME4L_IRQLEV_1) || (level > VME4L_IRQLEV_7) ||
 		(vector > 255 ))
 		return -EINVAL;
 
-	PLDZ002_LOCK_STATE();
+	PLDZ002_LOCK_STATE_IRQ(ps);
 
 	if( VME_REG_READ8( PLDZ002_INTR ) & PLDZ002_INTR_INTEN )
 		rv = -EBUSY;			/* interrupter busy */
@@ -1030,7 +993,7 @@ static int IrqGenerate(
 		VME_REG_WRITE8( PLDZ002_INTR, level | PLDZ002_INTR_INTEN );
 	}
 
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 
 
 	return rv;
@@ -1062,14 +1025,16 @@ static int IrqGenClear(
 	VME4L_BRIDGE_HANDLE *h,
 	int id)
 {
+	unsigned long ps;
+
 	if( id != _PLDZ002_INTERRUPTER_ID )
 		return -EINVAL;
 
-	PLDZ002_LOCK_STATE();
+	PLDZ002_LOCK_STATE_IRQ(ps);
 
 	VME_REG_CLRMASK8( PLDZ002_INTR, PLDZ002_INTR_INTEN );
 
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 	return 0;
 }
 
@@ -1089,14 +1054,16 @@ static int SysCtrlFuncGet( VME4L_BRIDGE_HANDLE *h)
  */
 static int SysCtrlFuncSet( VME4L_BRIDGE_HANDLE *h, int state)
 {
-	PLDZ002_LOCK_STATE();
+	unsigned long ps;
+
+	PLDZ002_LOCK_STATE_IRQ(ps);
 
 	if( state )
 		VME_REG_SETMASK8( PLDZ002_SYSCTL, PLDZ002_SYSCTL_SYSCON);
 	else
 		VME_REG_CLRMASK8( PLDZ002_SYSCTL, PLDZ002_SYSCTL_SYSCON);
 
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 	return 0;
 }
 
@@ -1105,9 +1072,11 @@ static int SysCtrlFuncSet( VME4L_BRIDGE_HANDLE *h, int state)
  */
 static int SysReset( VME4L_BRIDGE_HANDLE *h )
 {
-	PLDZ002_LOCK_STATE();
+	unsigned long ps;
+
+	PLDZ002_LOCK_STATE_IRQ(ps);
 	VME_REG_SETMASK8( PLDZ002_SYSCTL, PLDZ002_SYSCTL_SYSRES);
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 
 	return 0;
 }
@@ -1118,12 +1087,13 @@ static int SysReset( VME4L_BRIDGE_HANDLE *h )
 static int ArbToutGet( VME4L_BRIDGE_HANDLE *h, int clear)
 {
 	int state;
+	unsigned long ps;
 
-	PLDZ002_LOCK_STATE();
+	PLDZ002_LOCK_STATE_IRQ(ps);
 	state = !!(VME_REG_READ8( PLDZ002_SYSCTL ) & PLDZ002_SYSCTL_ATO);
 	if( clear )
 		VME_REG_SETMASK8( PLDZ002_SYSCTL, PLDZ002_SYSCTL_ATO);
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 	return state;
 }
 
@@ -1749,6 +1719,7 @@ int LocMonRegWriteFs2(
 static VME4L_BRIDGE_DRV G_bridgeDrv = {
 	.revisionInfo		= RevisionInfo,
 	.getSupportedBitstreams = GetSupportedBitstreams,
+	.getIrqStats		= GetIrqStats,
 	.requestAddrWindow 	= RequestAddrWindow,
 	.releaseAddrWindow 	= ReleaseAddrWindow,
 	.irqLevelCtrl		= IrqLevelCtrl,
@@ -1758,7 +1729,6 @@ static VME4L_BRIDGE_DRV G_bridgeDrv = {
 	.writePio8			= WritePio8,
 	.writePio16			= WritePio16,
 	.writePio32			= WritePio32,
-	.getVmeBlockSize		= GetVmeBlockSize,
 	.dmaSetup			= NULL,
 	.dmaBounceSetup		= NULL,
 	.dmaStart			= DmaStart,
@@ -1856,12 +1826,12 @@ static int PldZ002_CheckVmeBusError( VME4L_BRIDGE_HANDLE *h,
  * \param levP		where to store level
  *
  */
-static int PldZ002_ProcessPendingVmeInterrupts( VME4L_BRIDGE_HANDLE *h,
-										   int *vecP,
-										   int *levP )
+static int PldZ002_ProcessPendingVmeInterrupts(VME4L_BRIDGE_HANDLE *h,
+					       int *vecP,
+					       int *levP)
 {
-
 	uint8_t istat = 0;
+	uint8_t mstr = 0;
 
 	if (NULL == h){
 		printk(" *** %s: Bridge handle is NULL!\n", __FUNCTION__);
@@ -1870,10 +1840,10 @@ static int PldZ002_ProcessPendingVmeInterrupts( VME4L_BRIDGE_HANDLE *h,
 
 	istat = VME_REG_READ8( PLDZ002_MSTR ) & 0xff;
 
-    istat = VME_REG_READ8( PLDZ002_ISTAT  );
+	istat = VME_REG_READ8( PLDZ002_ISTAT  );
 	istat &= VME_REG_READ8( PLDZ002_IMASK );
 
-    if( istat != 0 ){
+	if( istat != 0 ){
 		/*--- decode *levP  ---*/
 		if( istat & 0x80 ) 	    *levP = VME4L_IRQLEV_7;
 		else if( istat & 0x40 ) *levP = VME4L_IRQLEV_6;
@@ -1885,13 +1855,20 @@ static int PldZ002_ProcessPendingVmeInterrupts( VME4L_BRIDGE_HANDLE *h,
 		else if( istat & 0x01 ){
 			*levP = VME4L_IRQLEV_ACFAIL;
 			*vecP = VME4L_IRQVEC_ACFAIL;
+			printk(KERN_ERR_PFX "%s: istat\n", __func__);
 			return 1;
 		}
 		/* fetch vector (VME IACK cycle) */
 		*vecP = VME_WIN_READ8( (char *)h->iack.vaddr + ( *levP<<1 ) + 1 );
 		/* check for bus error during IACK (spurious irq) */
-		if( VME_REG_READ8( PLDZ002_MSTR ) & PLDZ002_MSTR_BERR ){
+		mstr = VME_REG_READ8(PLDZ002_MSTR);
+		if(mstr & PLDZ002_MSTR_BERR) {
 			/* clear bus error */
+			printk(KERN_ERR_PFX "%s: bus error during vme interrupt?\n", __func__);
+			if (mstr & PLDZ002_MSTR_IBERREN) {
+				/* irq enabled count it */
+				h->irqs.ber++;
+			}
 			StoreAndClearBuserror(h);
 			*vecP = VME4L_IRQVEC_SPUR;
 		}
@@ -1913,9 +1890,9 @@ static int PldZ002_ProcessPendingVmeInterrupts( VME4L_BRIDGE_HANDLE *h,
  *				    processed, these are: DMA finished, Mailbox receive,
  *					location monitor
  */
-static int PldZ002_CheckMiscVmeInterrupts( VME4L_BRIDGE_HANDLE *h,
-										 int *vecP,
-										 int *levP)
+static int PldZ002_CheckDmaVmeInterrupts(VME4L_BRIDGE_HANDLE *h,
+					 int *vecP,
+					 int *levP)
 {
 	uint8_t dmastat = 0;
 
@@ -1928,21 +1905,44 @@ static int PldZ002_CheckMiscVmeInterrupts( VME4L_BRIDGE_HANDLE *h,
 	dmastat = VME_REG_READ8( PLDZ002_DMASTA );
 	if( dmastat & ( PLDZ002_DMASTA_IRQ | PLDZ002_DMASTA_ERR) ) {
 		/* 1. check if DMA error occured ? if yes, stop DMA activity and clear DMA error & clear DMA */
-		if( dmastat & PLDZ002_DMASTA_IRQ ) {
-			/* regular finished DMA. Reset DMA irq */
-		VME_REG_WRITE8( PLDZ002_DMASTA, PLDZ002_DMASTA_IRQ );
-		*levP = VME4L_IRQLEV_DMAFINISHED;
-		} else {
-			printk(KERN_ERR_PFX "%s: DMA error occured, stop DMA and clear DMA IRQ and error\n",
-			       __func__);
+		if( dmastat & PLDZ002_DMASTA_ERR ) {
+			printk(KERN_ERR_PFX "%s: DMA error occured, stop DMA and clear DMA IRQ and error DMASTA8=0x%x\n",
+			       __func__, dmastat);
 			/* clear by writing '1' to the bits, DMA also stopped by setting its bit to 0 */
 			VME_REG_WRITE8( PLDZ002_DMASTA, PLDZ002_DMASTA_IRQ | PLDZ002_DMASTA_ERR);
 			*levP = VME4L_IRQLEV_BUSERR;
+			h->dmaError = 1;
+			{
+				int i;
+				char *bdVaddr;
+				bdVaddr = MEN_PLDZ002_DMABD_OFFS;
+				printk(KERN_ERR_PFX "%s DmaBD setup:\n", __func__);
+				for(i=0; i < PLDZ002_DMA_MAX_BDS; i++ ){
+					printk(KERN_ERR_PFX "BD%02d@%x: %08x %08x %08x %08x\n",
+						i, bdVaddr,
+						VME_GENREG_READ32( bdVaddr+0x0 ),
+						VME_GENREG_READ32( bdVaddr+0x4 ),
+						VME_GENREG_READ32( bdVaddr+0x8 ),
+						VME_GENREG_READ32( bdVaddr+0xc ));
+					bdVaddr+=0x10;
+				}
+			}
+		} else {
+			/* regular finished DMA. Reset DMA irq */
+			VME_REG_WRITE8( PLDZ002_DMASTA, PLDZ002_DMASTA_IRQ );
+			*levP = VME4L_IRQLEV_DMAFINISHED;
 		}
 		*vecP = 0;
 		return 1;
 	}
 
+	return 0;
+}
+
+static int PldZ002_CheckMailboxInterrupts(VME4L_BRIDGE_HANDLE *h,
+					  int *vecP,
+					  int *levP)
+{
 	/* check for mailbox irqs */
 	*vecP = HighestBitSet( VME_REG_READ8( PLDZ002_MAIL_IRQ_STAT ));
 	if( *vecP >= 0 ){
@@ -1954,6 +1954,14 @@ static int PldZ002_CheckMiscVmeInterrupts( VME4L_BRIDGE_HANDLE *h,
 		*levP 	+= VME4L_IRQLEV_MBOXRD(0);
 		return 1;
 	}
+
+	return 0;
+}
+
+static int PldZ002_CheckLocationMonitorInterrupts(VME4L_BRIDGE_HANDLE *h,
+						  int *vecP,
+						  int *levP)
+{
 	/* check for location monitor irqs */
 	if( (VME_REG_READ8( PLDZ002_LM_STAT_CTRL_0 ) &
 				(PLDZ002_LM_STAT_CTRL_IRQ | PLDZ002_LM_STAT_CTRL_IRQ_EN)) ==
@@ -1997,37 +2005,107 @@ static irqreturn_t PldZ002Irq(int irq, void *dev_id )
 	int vector=0, level=VME4L_IRQLEV_UNKNOWN;
 	VME4L_BRIDGE_HANDLE *h 	= (VME4L_BRIDGE_HANDLE *)dev_id;
 	int handled=1;
+	int something_handled = 0;
 	/* VME4LDBG */
 	PLDZ002_LOCK_STATE();
 
-	/* 1. check for bus errors */
-	if (PldZ002_CheckVmeBusError( h, &vector, &level ))
-		goto DONE;
+	/* lock for irq stat */
+	if (h->irqs.sequence & 1) {
+		/* This should never happen */
+		printk(KERN_ERR_PFX "%s: irq stats already locked "
+		       "sequence number %\n", __func__, h->irqs.sequence);
+		/* make sure it gets to the unlocked value */
+		h->irqs.sequence++;
+	}
+	h->irqs.sequence++;
 
-	/* 2. get pending VME interrupts, perform IACK */
-	if (PldZ002_ProcessPendingVmeInterrupts( h, &vector, &level ))
-		goto DONE;
+	h->irqs.hw_total++;
+	while (handled) {
+		handled = 0;
 
-	/* 3. check the other IRQ causes (DMA/Mailbox/location monitor) */
-	if (PldZ002_CheckMiscVmeInterrupts(h, &vector, &level))
-		goto DONE;
+		/* 2. get pending VME interrupts, perform IACK */
+		if (0 < PldZ002_ProcessPendingVmeInterrupts( h, &vector, &level )){
+			handled = 1;
+			something_handled++;
+			h->irqs.vme++;
+			h->irqs.levels[level]++;
+			VME4LDBG("PldZ002Irq: ProcessPendingVmeInterrupts vector=%d level=%d\n", vector, level);
 
-	/* no interrupt source -> exit */
-	handled=0;
+			vme4l_irq( level, vector, regs );
+		}
 
-	printk(KERN_ERR_PFX "%s: unhandled irq! vec=%d lev=%d\n",
-	       __func__, vector, level );
-	goto EXIT;
+		/* 1. check for bus errors */
+		if (0 < PldZ002_CheckVmeBusError( h, &vector, &level )){
+			handled = 1;
+			something_handled++;
+			h->irqs.ber++;
+			h->irqs.levels[level]++;
+			VME4LDBG("PldZ002Irq: CheckVmeBusError vector=%d level=%d\n", vector, level);
 
- DONE:
-	VME4LDBG("PldZ002Irq: vector=%d level=%d\n", vector, level );
+			vme4l_irq( level, vector, regs );
+		}
 
-	vme4l_irq( level, vector, regs );
 
- EXIT:
+		/* 3. check the other IRQ causes (DMA) */
+		if (0 < PldZ002_CheckDmaVmeInterrupts(h, &vector, &level)){
+			handled = 1;
+			something_handled++;
+			h->irqs.dma++;
+			h->irqs.levels[level]++;
+			VME4LDBG("PldZ002Irq: PldZ002_CheckDmaVmeInterrupts vector=%d level=%d\n", vector, level);
+
+			vme4l_irq( level, vector, regs );
+		}
+		/* 4. check the other IRQ causes (Mailbox) */
+		if (0 < PldZ002_CheckMailboxInterrupts(h, &vector, &level)){
+			handled = 1;
+			something_handled++;
+			h->irqs.mbox++;
+			h->irqs.levels[level]++;
+			VME4LDBG("PldZ002Irq: PldZ002_CheckMailboxInterrupts vector=%d level=%d\n", vector, level);
+
+			vme4l_irq( level, vector, regs );
+		}
+		/* 5. check the other IRQ causes (location monitor) */
+		if (0 < PldZ002_CheckLocationMonitorInterrupts(h, &vector, &level)){
+			handled = 1;
+			something_handled++;
+			h->irqs.mon++;
+			h->irqs.levels[level]++;
+			VME4LDBG("PldZ002Irq: PldZ002_CheckLocationMonitorInterrupts vector=%d level=%d\n", vector, level);
+
+			vme4l_irq( level, vector, regs );
+		}
+	}
+	h->irqs.handled += something_handled;
+
+
+	if (!something_handled) {
+		VME4LDBG("%s: unhandled int!\n", __func__);
+		h->irqs.spurious++;
+	} else {
+		VME4LDBG("%s: irq_dma %d, irq_mailbox %d, irq_monitor %d, "
+		         "irq_vme %d, irq_bus_error %d\n",
+			 __func__, h->irqs.dma, h->irqs.mbox, h->irqs.mon,
+			 h->irqs.vme, h->irqs.ber);
+	}
+	VME4LDBG("%s: handled_total %d, ints_total %d, something_handled %d "
+		 "delta %d\n",
+		 __func__, h->irqs.handled, h->irqs.hw_total,
+		 something_handled, h->irqs.handled - h->irqs.hw_total);
+
+	if (!(h->irqs.sequence & 1)) {
+		/* This should never happen */
+		printk(KERN_ERR_PFX "%s: irq stats already unlocked "
+		       "sequence number %\n", __func__, h->irqs.sequence);
+		/* make sure it gets to the locked value */
+		h->irqs.sequence++;
+	}
+	h->irqs.sequence++;
+
 	PLDZ002_UNLOCK_STATE();
 
-	return handled ? IRQ_HANDLED : IRQ_NONE;
+	return something_handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
 
@@ -2118,6 +2196,7 @@ static void InitBridge( VME4L_BRIDGE_HANDLE *h )
 	/* clear DMA */
 	VME_REG_WRITE8( PLDZ002_DMASTA,
 			PLDZ002_DMASTA_IRQ | PLDZ002_DMASTA_ERR );
+	h->dmaError = 0;
 
 	/* clear locmon */
 	VME_REG_WRITE8( PLDZ002_LM_STAT_CTRL_0, PLDZ002_LM_STAT_CTRL_IRQ );
@@ -2287,7 +2366,7 @@ static int vme4l_probe( CHAMELEONV2_UNIT_T *chu )
 #else
 						SA_SHIRQ,
 #endif
-						"Z002_LX",
+						"men_vme_bridge",
 						h))<0 )
 			goto CLEANUP;
 	}
@@ -2391,9 +2470,11 @@ static int vme4l_remove( CHAMELEONV2_UNIT_T *chu )
 
 int vme4l_register_client( VME4L_BRIDGE_HANDLE *h )
 {
-	PLDZ002_LOCK_STATE();
+	unsigned long ps;
+
+	PLDZ002_LOCK_STATE_IRQ(ps);
 	++h->refCounter;
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 
 	return 0;
 }
@@ -2401,12 +2482,14 @@ EXPORT_SYMBOL_GPL(vme4l_register_client);
 
 int vme4l_unregister_client( VME4L_BRIDGE_HANDLE *h )
 {
-	PLDZ002_LOCK_STATE();
+	unsigned long ps;
+
+	PLDZ002_LOCK_STATE_IRQ(ps);
 	if (h->refCounter <= 0)
 		return -EINVAL;
 
 	--h->refCounter;
-	PLDZ002_UNLOCK_STATE();
+	PLDZ002_UNLOCK_STATE_IRQ(ps);
 
 	return 0;
 }

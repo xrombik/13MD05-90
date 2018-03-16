@@ -1102,52 +1102,62 @@ static int vme4l_rw_pio( VME4L_SPACE spc, VME4L_RW_BLOCK *blk, int swapMode )
 static int vme4l_start_wait_dma(void)
 {
 	int rv;
-	unsigned long ps;
 	uint32_t ticks = 5 * HZ;
+
 	wait_queue_t __wait;
 
-	VME4L_LOCK_DMA(ps);
+	/* Add to wait queue before starting DMA */
+	init_waitqueue_entry(&__wait, current);
+	add_wait_queue(&G_dmaWq, &__wait);
+	set_current_state(TASK_UNINTERRUPTIBLE);
 
 	/* start DMA */
 	if( (rv = G_bDrv->dmaStart( G_bHandle )) < 0 ){
-		VME4L_UNLOCK_DMA(ps);
+		if (rv < 0)
+			printk(KERN_ERR_PFX "%s: DMA dmaStart rv=%d\n",
+			       __func__, rv );
 		goto ABORT;
 	}
 
-	init_waitqueue_entry(&__wait, current);
-
-	add_wait_queue(&G_dmaWq, &__wait);
 	for (;;) {
-		set_current_state(TASK_UNINTERRUPTIBLE);
+		VME4LDBG("vme4l_start_wait_dma: going to sleep %d\n", ticks);
+		ticks = schedule_timeout( ticks );
+
+		if( ticks == 0 ){
+			printk(KERN_ERR_PFX "%s: DMA timeout\n", __func__);
+		}
 
 		/* check DMA state */
 		rv = G_bDrv->dmaStatus( G_bHandle );
 		if( rv <= 0 ){
 			/* error or ok */
-			VME4LDBG("vme4l_start_wait_dma: DMA status %d\n", rv );
+			if (rv < 0)
+				printk(KERN_ERR_PFX "%s: DMA status %d\n",
+				       __func__, rv);
 			break;
 		}
-		VME4L_UNLOCK_DMA(ps);
-		VME4LDBG("vme4l_start_wait_dma: going to sleep %d\n", ticks);
-		ticks = schedule_timeout( ticks );
-
-		VME4L_LOCK_DMA( ps );
 
 		if( ticks == 0 ){
-			printk(KERN_ERR_PFX "%s: DMA timeout\n", __func__);
+			printk(KERN_ERR_PFX "%s: DMA timeout DMA not finished\n", __func__);
 			/* DMA timed out */
 			rv = -ETIME;
 			break;
 		}
 		VME4LDBG("vme4l_start_wait_dma: remaining %d ticks\n", ticks );
+
+		/* In case we execute more loop iterations task has go to
+		   TASK_UNINTERRUPTIBLE again */
+		set_current_state(TASK_UNINTERRUPTIBLE);
 	}
 
 	set_current_state(TASK_RUNNING);
-	remove_wait_queue(&G_dmaWq, &__wait);
-	VME4L_UNLOCK_DMA(ps);
-
  ABORT:
-	VME4LDBG("vme4l_start_wait_dma: exit %d\n", rv);
+
+
+	remove_wait_queue(&G_dmaWq, &__wait);
+
+	if (rv<0)
+		printk(KERN_ERR_PFX "%s: exit rv=%d\n", __func__, rv);
 
 	return rv;
 }
@@ -1172,17 +1182,9 @@ static int vme4l_perform_zc_dma(
 	int flags)
 {
 	int rv=0;
-	int dmaLeft = 0;
-	dma_addr_t dmaAddr = 0;
-	int vme_block_size = 0;
 
 	if( down_interruptible( &G_dmaMutex ))
 		return -ERESTARTSYS;
-
-	if (flags & VME4L_RW_NOVMEINC) {
-		/* get VME (M)BLT block transfer size */
-		vme_block_size = G_bDrv->getVmeBlockSize(spc);
-	}
 
 	while( sgNelems > 0 ){
 
@@ -1195,18 +1197,17 @@ static int vme4l_perform_zc_dma(
 			direction,
 			swapMode,
 			&vmeAddr,
-			&dmaAddr,
-			&dmaLeft,
-			vme_block_size,
 			flags);
 
 		VME4LDBG( "vme4l_perform_zc_dma: dmaSetup rv=%d, next vmeAddr=0x%lx\n", rv, vmeAddr );
 
-		if( rv < 0 )
+		if( rv < 0 ) {
+			printk(KERN_ERR_PFX "%s: dmaSetup rv=%d\n",
+			       __func__, rv);
 			goto ABORT;
+		}
 
-		/* NOTE: rv == 0 is a valid rv for novmeinc */
-		if (rv > sgNelems){
+		if( rv == 0 || rv > sgNelems){
 			rv = -EINVAL;		/* bug in bridge driver... */
 			goto ABORT;
 		}
@@ -1217,8 +1218,11 @@ static int vme4l_perform_zc_dma(
 		/* start&wait for DMA */
 		rv = vme4l_start_wait_dma();
 
-		if( rv < 0 )
+		if (rv < 0) {
+			printk(KERN_ERR_PFX "%s: vme4l_start_wait_dma rv=%d\n",
+			       __func__, rv);
 			goto ABORT;
+		}
 	}
 
  ABORT:
@@ -1313,8 +1317,13 @@ static int vme4l_zc_dma( VME4L_SPACE spc, VME4L_RW_BLOCK *blk, int swapMode )
 	nr_pages = ((uaddr & ~PAGE_MASK) + count + ~PAGE_MASK) >> PAGE_SHIFT;
 
 	/* User attempted Overflow! */
-	if ((uaddr + count) < uaddr)
+	if ((uaddr + count) < uaddr) {
+		printk(KERN_ERR_PFX "%s: User attempted Overflow "
+		       "(uaddr + count) < uaddr, (uaddr + count)0x%x, "
+		       "uaddr 0x%x, count 0x%x\n",
+		       __func__, (uaddr + count), uaddr, count);
 		return -EINVAL;
+	}
 
 	if ((pages = kmalloc(nr_pages * sizeof(*pages), GFP_ATOMIC)) == NULL)
 		return -ENOMEM;
@@ -1329,8 +1338,14 @@ static int vme4l_zc_dma( VME4L_SPACE spc, VME4L_RW_BLOCK *blk, int swapMode )
 	if (to_user) {
 		VME4LDBG("To/from Userspace DMA transfer\n");
 		rv = get_user_pages_fast( uaddr, nr_pages, direction, pages);
-		if( rv < nr_pages )
+		if (rv < 0)
+			printk(KERN_ERR_PFX "%s: get_user_pages_fast failed rv"
+			       "%d nr pages %d\n",
+			       __func__, rv, nr_pages);
+
+		if (rv < nr_pages) {
 			goto CLEANUP;
+		}
 	} else {
 		VME4LDBG("To/from Kernelspace DMA transfer\n");
 		addr = (void *)uaddr;
@@ -1366,7 +1381,7 @@ static int vme4l_zc_dma( VME4L_SPACE spc, VME4L_RW_BLOCK *blk, int swapMode )
 			sgList->dmaLength = count - totlen;
 		}
 
-		dmaAddr = dma_map_single( pDev, pVirtAddr, sgList->dmaLength, direction );
+            dmaAddr = dma_map_single( pDev, pVirtAddr, sgList->dmaLength, direction );
 		if ( dma_mapping_error(pDev, dmaAddr ) ) {
                    printk(KERN_ERR_PFX "%s: *** error mapping DMA space!\n" ,
 			  __func__);
@@ -1407,6 +1422,9 @@ CLEANUP:
 	if (pKmalloc)
 		kfree ( pKmalloc );
 
+	if (rv < 0)
+		printk(KERN_ERR_PFX "%s: rv=%d\n", __func__, rv);
+
 	return rv >= 0 ? totlen : rv;
 }
 
@@ -1425,14 +1443,13 @@ static int vme4l_bounce_dma( VME4L_SPACE spc, VME4L_RW_BLOCK *blk,
 	size_t len = blk->size;
 	vmeaddr_t vmeAddr = blk->vmeAddr;
 	char *userSpc = blk->dataP;
-	int novmeinc = blk->flags & VME4L_RW_NOVMEINC;
 
 	if( down_interruptible( &G_dmaMutex ))
 		return -ERESTARTSYS;
 
 	VME4LDBG("-> vme4l_bounce_dma\n");
 
-	if (novmeinc)
+	if (blk->flags & VME4L_RW_NOVMEINC)
 		printk(KERN_ERR_PFX "%s: NOVMEINC not supported in "
 		       "bounce buffer DMA mode!\n",
 		       __func__);
@@ -1515,7 +1532,7 @@ int vme4l_rw(VME4L_SPACE spc, VME4L_RW_BLOCK *blk, int swapMode)
 			 blk->dataP,
 			 swapMode );
 
-	if( spcEnt->isBlt || (blk->flags & VME4L_RW_USE_DMA))
+	if( spcEnt->isBlt || (blk->flags & VME4L_RW_USE_SGL_DMA))
 	{
 		if( G_bDrv->dmaSetup == NULL ){
 			if( G_bDrv->dmaBounceSetup == NULL ){
@@ -1535,6 +1552,21 @@ int vme4l_rw(VME4L_SPACE spc, VME4L_RW_BLOCK *blk, int swapMode)
 	else {
 		rv = vme4l_rw_pio( spc, blk, swapMode );
 	}
+
+	if (rv < 0)
+		printk(KERN_ERR_PFX "%s: %s rv=%d, spc=%d vmeAddr=0x%lx "
+		       "acc=%d sz=0x%lx dataP=0x%p flags=0x%x, swp=0x%x\n",
+		       __func__,
+		       blk->direction ? "write":"read",
+		       rv,
+		       spc,
+		       blk->vmeAddr,
+		       blk->accWidth,
+		       blk->size,
+		       blk->dataP,
+		       blk->flags,
+		       swapMode);
+
  ABORT:
 	VME4LDBG("vme4l_rw exit rv=%d\n", rv);
 	return rv;
@@ -1890,21 +1922,19 @@ void vme4l_irq( int level, int vector, struct pt_regs *regs)
 	VME4L_IRQ_ENTRY *ent;
 	struct list_head *pos;
 	unsigned long ps;
-	static unsigned long _flags=0;
+	static unsigned long _flags=0; /* Adam: Why static? */
 	int doDisable=0;
 
 	VME4LDBG("vme4l_irq() level=%d vector=%d \n", level, vector);
 
 	if( vector == VME4L_IRQVEC_SPUR )
 		printk( KERN_WARNING "VME4L: spurious interrupt level %d\n", level );
-
-
-	else if( level == VME4L_IRQLEV_DMAFINISHED ){
-		VME4L_LOCK_DMA(ps);
+	else if(level == VME4L_IRQLEV_DMAFINISHED /* DMA finished */
+		|| (level == VME4L_IRQLEV_BUSERR && vector == 0) /* DMA failed */
+		){
 		VME4LDBG("DMA finished, wake G_dmaWq\n");
 		/* wake up waiting task */
 		wake_up( &G_dmaWq );
-		VME4L_UNLOCK_DMA(ps);
 	}
 	else
 	{  /* brace2 */
@@ -2914,7 +2944,7 @@ static char *vme4l_rev_info( char *buf )
 
 	p += sprintf( p, "vme4l-core $Revision: 1.18 $,  ");
 
-	if( G_bDrv ){
+	if( G_bDrv && G_bDrv->revisionInfo){
 		G_bDrv->revisionInfo( G_bHandle, p );
 	}
 	else {
@@ -2980,6 +3010,75 @@ static int vme4l_window_proc_show(struct seq_file *m, void *data)
 
 static int vme4l_interrupts_proc_show(struct seq_file *m, void *data)
 {
+	int tries = 10;
+	int i;
+	int ret;
+
+	VME4L_IRQ_STAT irqs;
+	seq_printf(m, "Interrupts\n");
+
+	if (!G_bDrv) {
+		printk(KERN_ERR_PFX "%s: G_bDrv not initialized\n",
+		       __func__);
+		return -1;
+	}
+
+	if (!G_bDrv->getIrqStats) {
+		printk(KERN_ERR_PFX "%s: G_bDrv->getIrqStats not initialized\n",
+		       __func__);
+		return -1;
+	}
+
+	while (1) {
+		ret = G_bDrv->getIrqStats(G_bHandle, &irqs, sizeof(irqs));
+		if (!ret) {
+			/* we have a valid and consistent data */
+			break;
+		}
+		tries--;
+		udelay(1000);
+		if (!tries) {
+			printk(KERN_ERR_PFX "%s: Unable to get consistent "
+			       "irq stats for the VME bridge!\n", __func__);
+			return -1;
+		}
+	}
+
+	seq_printf(m, "------------------------------------------\n");
+	seq_printf(m, "ISR stats:\n");
+	seq_printf(m, "VME interrupts                  %10lld\n", irqs.vme);
+	seq_printf(m, "Bus error interrupts            %10lld\n", irqs.ber);
+	seq_printf(m, "DMA interrupts                  %10lld\n", irqs.dma);
+	seq_printf(m, "MailBox interrupts              %10lld\n", irqs.mbox);
+	seq_printf(m, "Mocation Monitor interrupts     %10lld\n", irqs.mon);
+	seq_printf(m, "Total HW interrupts             %10lld\n", irqs.hw_total);
+	seq_printf(m, "Handled interrupts              %10lld\n", irqs.handled);
+	seq_printf(m, "Not handled interrupts          %10lld\n", irqs.spurious);
+	seq_printf(m, "Handled + spurious              %10lld\n", irqs.handled + irqs.spurious);
+	/* If this is more than 0, it means that during at least one
+	 * HW interrupt, at least two interrupt sources were handled */
+	seq_printf(m, "(Handled + spurious) - total    %10lld\n", (irqs.handled + irqs.spurious) - irqs.hw_total);
+	seq_printf(m, "------------------------------------------\n");
+	seq_printf(m, "IRQ level unknown               %10lld\n", irqs.levels[VME4L_IRQLEV_UNKNOWN]);
+	for (i = 0; i < VME4L_IRQLEV_NUM; i++) {
+		seq_printf(m, "IRQ level %d                     %10lld\n", i + VME4L_IRQLEV_1, irqs.levels[i + VME4L_IRQLEV_1]);
+	}
+	seq_printf(m, "IRQ level bus error             %10lld\n", irqs.levels[VME4L_IRQLEV_BUSERR]);
+	seq_printf(m, "IRQ level ACFAIL                %10lld\n", irqs.levels[VME4L_IRQLEV_ACFAIL]);
+	seq_printf(m, "IRQ level SYSFAIL               %10lld\n", irqs.levels[VME4L_IRQLEV_SYSFAIL]);
+	for (i = 0; i < VME4L_IRQLEV_MBOXWR_NNUM; i++) {
+		seq_printf(m, "IRQ level RX mailbox %d          %10lld\n", i, irqs.levels[VME4L_IRQLEV_MBOXRD(i)]);
+		seq_printf(m, "IRQ level TX mailbox %d          %10lld\n", i, irqs.levels[VME4L_IRQLEV_MBOXWR(i)]);
+	}
+	for (i = 0; i < VME4L_IRQLEV_LOCMON_NUM; i++) {
+		seq_printf(m, "IRQ level location monitor %2d   %10lld\n", i, irqs.levels[VME4L_IRQLEV_LOCMON(i)]);
+	}
+
+	return 0;
+}
+
+static int vme4l_irq_proc_show(struct seq_file *m, void *data)
+{
 	int vector;
 	unsigned long ps;
 	struct list_head *pos_v;
@@ -3002,12 +3101,12 @@ static int vme4l_interrupts_proc_show(struct seq_file *m, void *data)
 				switch(ent->entType){
 
 				case VME4L_USER_IRQ:
-					seq_printf(m, "user sig=%d task=%p\n",
+					seq_printf(m, ", user sig=%d task=%p\n",
 								ent->u.user.signal, ent->u.user.task);
 					break;
 
 				case VME4L_KERNEL_IRQ:
-					seq_printf(m, "kernel dev=%s id=%p\n",
+					seq_printf(m, ", kernel dev=%s id=%p\n",
 						    ent->u.kernel.device,
 						    ent->u.kernel.dev_id);
 					break;
@@ -3020,7 +3119,7 @@ static int vme4l_interrupts_proc_show(struct seq_file *m, void *data)
 	return 0;
 }
 
-static int vme4l_irq_levels_proc_show(struct seq_file *m, void *data)
+static int vme4l_irq_levels_enable_proc_show(struct seq_file *m, void *data)
 {
 	int level;
 
@@ -3083,6 +3182,18 @@ static const struct file_operations vme4l_window_proc_ops = {
 	.release	= single_release,
 };
 
+static int vme4l_irq_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, vme4l_irq_proc_show, NULL);
+}
+
+static const struct file_operations vme4l_irq_proc_ops = {
+	.open		= vme4l_irq_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static int vme4l_interrupts_proc_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, vme4l_interrupts_proc_show, NULL);
@@ -3095,13 +3206,13 @@ static const struct file_operations vme4l_interrupts_proc_ops = {
 	.release	= single_release,
 };
 
-static int vme4l_irq_levels_proc_open(struct inode *inode, struct file *file)
+static int vme4l_irq_levels_enable_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, vme4l_irq_levels_proc_show, NULL);
+	return single_open(file, vme4l_irq_levels_enable_proc_show, NULL);
 }
 
-static const struct file_operations vme4l_irq_levels_proc_ops = {
-	.open		= vme4l_irq_levels_proc_open,
+static const struct file_operations vme4l_irq_levels_enable_proc_ops = {
+	.open		= vme4l_irq_levels_enable_proc_open,
 	.read		= seq_read,
 	.llseek		= seq_lseek,
 	.release	= single_release,
@@ -3121,11 +3232,15 @@ static void vme_bridge_procfs_register(void)
 	if (!entry)
 		printk(KERN_WARNING "vme4l: Failed to create proc windows node\n");
 
+	entry = proc_create("irq", S_IFREG | S_IRUGO, vme4l_root, &vme4l_irq_proc_ops);
+	if (!entry)
+		printk(KERN_WARNING "vme4l: Failed to create proc irq node\n");
+
 	entry = proc_create("interrupts", S_IFREG | S_IRUGO, vme4l_root, &vme4l_interrupts_proc_ops);
 	if (!entry)
 		printk(KERN_WARNING "vme4l: Failed to create proc interrupts node\n");
 
-	entry = proc_create("irq_levels", S_IFREG | S_IRUGO, vme4l_root, &vme4l_irq_levels_proc_ops);
+	entry = proc_create("irq_levels_enable", S_IFREG | S_IRUGO, vme4l_root, &vme4l_irq_levels_enable_proc_ops);
 	if (!entry)
 		printk(KERN_WARNING "vme4l: Failed to create proc irq node\n");
 
@@ -3137,8 +3252,9 @@ static void vme_bridge_procfs_register(void)
 static void vme_bridge_procfs_unregister(void)
 {
 	remove_proc_entry("supported_bitstreams", vme4l_root);
-	remove_proc_entry("irq_levels", vme4l_root);
+	remove_proc_entry("irq_levels_enable", vme4l_root);
 	remove_proc_entry("interrupts", vme4l_root);
+	remove_proc_entry("irq", vme4l_root);
 	remove_proc_entry("windows", vme4l_root);
 	remove_proc_entry("info", vme4l_root);
 	remove_proc_entry("vme4l", NULL);
